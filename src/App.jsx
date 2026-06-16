@@ -1,7 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { db, isFirebaseConfigured } from "./firebase";
 import {
-  doc, setDoc, collection, query, orderBy, limit, getDocs, serverTimestamp,
+  doc, setDoc, deleteDoc, collection, query, orderBy, limit, getDocs,
+  serverTimestamp,
 } from "firebase/firestore";
 
 /* ════════════════════════════════════════════
@@ -27,7 +28,7 @@ function detect(buf, sr) {
   let rms = 0;
   for (let i = 0; i < n; i++) rms += buf[i] * buf[i];
   rms = Math.sqrt(rms / n);
-  if (rms < 0.012) return [null, rms];
+  if (rms < 0.02) return [null, rms];
 
   let s = 0, e = n - 1;
   for (let i = 0; i < n / 2; i++) if (Math.abs(buf[i]) < 0.2) { s = i; break; }
@@ -49,6 +50,8 @@ function detect(buf, sr) {
   let mxV = -Infinity, mxP = d;
   for (let i = d; i < len; i++) if (ac[i] > mxV) { mxV = ac[i]; mxP = i; }
   if (mxP <= 0 || mxP >= len - 1) return [null, rms];
+
+  if (ac[0] > 0 && mxV / ac[0] < 0.5) return [null, rms];
 
   const y1 = ac[mxP - 1], y2 = ac[mxP], y3 = ac[mxP + 1];
   const aa = (y1 + y3 - 2 * y2) / 2;
@@ -274,7 +277,7 @@ function drawResult(loFreq, hiFreq, loNote, hiNote, titleObj) {
 
 const MEDALS = ["🥇", "🥈", "🥉"];
 
-function RankingCard({ title, icon, entries, formatValue, uid }) {
+function RankingCard({ title, icon, entries, formatValue, uid, isAdmin, onDelete }) {
   return (
     <div style={{
       background: "#141b2d", border: "1px solid #1e293b", borderRadius: 10,
@@ -304,6 +307,12 @@ function RankingCard({ title, icon, entries, formatValue, uid }) {
           <span style={{ fontSize: 13, color: "#94a3b8", fontFamily: "monospace", flexShrink: 0 }}>
             {formatValue(r)}
           </span>
+          {isAdmin && (
+            <button onClick={() => onDelete(r.id)} style={{
+              background: "#7f1d1d", color: "#fca5a5", border: "none", borderRadius: 4,
+              padding: "2px 8px", fontSize: 11, cursor: "pointer", flexShrink: 0
+            }}>✕</button>
+          )}
         </div>
       ))}
     </div>
@@ -334,6 +343,7 @@ export default function VoiceRangeAnalyzer() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [nameError, setNameError] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   const acRef = useRef(null);
   const anRef = useRef(null);
@@ -342,8 +352,18 @@ export default function VoiceRangeAnalyzer() {
   const pbRef = useRef([]);
   const loRef = useRef(null);
   const hiRef = useRef(null);
+  const susRef = useRef({ semi: null, count: 0 });
 
   const uid = useRef(getOrCreateUserId()).current;
+
+  /* ─── Admin Mode ─── */
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const key = params.get("admin");
+    const adminKey = import.meta.env.VITE_ADMIN_KEY;
+    if (adminKey && key === adminKey) setIsAdmin(true);
+  }, []);
 
   /* ─── Name ─── */
 
@@ -399,6 +419,14 @@ export default function VoiceRangeAnalyzer() {
     setSaving(false);
   }, [userName, uid, loN, hiN, loF, hiF, fetchRankings]);
 
+  const deleteRanking = useCallback(async (docId) => {
+    if (!db || !isAdmin) return;
+    try {
+      await deleteDoc(doc(db, "rankings", docId));
+      fetchRankings();
+    } catch (e) { console.error(e); }
+  }, [isAdmin, fetchRankings]);
+
   /* ─── Voice Analyzer ─── */
 
   const start = useCallback(async () => {
@@ -413,6 +441,7 @@ export default function VoiceRangeAnalyzer() {
       ac.createMediaStreamSource(stream).connect(an);
       acRef.current = ac; anRef.current = an; stRef.current = stream;
       pbRef.current = [];
+      susRef.current = { semi: null, count: 0 };
       setOn(true);
 
       const loop = () => {
@@ -422,22 +451,36 @@ export default function VoiceRangeAnalyzer() {
         setRms(Math.min(r * 8, 1));
         if (f) {
           const pb = pbRef.current;
-          pb.push(f); if (pb.length > 6) pb.shift();
-          if (pb.length >= 3) {
-            const last = pb.slice(-3).map(semiOf);
-            if (Math.max(...last) - Math.min(...last) < 1.5) {
+          pb.push(f); if (pb.length > 10) pb.shift();
+          if (pb.length >= 5) {
+            const last = pb.slice(-5).map(semiOf);
+            if (Math.max(...last) - Math.min(...last) < 1.2) {
               const sf = pb[pb.length - 1];
               const sn = freqToNote(sf);
               setFreq(sf); setNote(sn);
-              if (loRef.current === null || sf < loRef.current) {
-                loRef.current = sf; setLoF(sf); setLoN(sn);
+
+              const currentSemi = Math.round(semiOf(sf));
+              if (susRef.current.semi === currentSemi) {
+                susRef.current.count++;
+              } else {
+                susRef.current.semi = currentSemi;
+                susRef.current.count = 1;
               }
-              if (hiRef.current === null || sf > hiRef.current) {
-                hiRef.current = sf; setHiF(sf); setHiN(sn);
+
+              if (susRef.current.count >= 5) {
+                if (loRef.current === null || sf < loRef.current) {
+                  loRef.current = sf; setLoF(sf); setLoN(sn);
+                }
+                if (hiRef.current === null || sf > hiRef.current) {
+                  hiRef.current = sf; setHiF(sf); setHiN(sn);
+                }
               }
             }
           }
-        } else { setFreq(null); setNote(null); }
+        } else {
+          setFreq(null); setNote(null);
+          susRef.current = { semi: null, count: 0 };
+        }
         rafRef.current = requestAnimationFrame(loop);
       };
       loop();
@@ -455,6 +498,7 @@ export default function VoiceRangeAnalyzer() {
 
   const reset = useCallback(() => {
     loRef.current = null; hiRef.current = null;
+    susRef.current = { semi: null, count: 0 };
     setLoF(null); setHiF(null); setLoN(null); setHiN(null);
     setImg(null); setSaved(false);
     pbRef.current = [];
@@ -493,6 +537,15 @@ export default function VoiceRangeAnalyzer() {
       display: "flex", flexDirection: "column", alignItems: "center",
       padding: "24px 16px 40px"
     }}>
+      {/* Admin badge */}
+      {isAdmin && (
+        <div style={{
+          position: "fixed", top: 8, left: 8, zIndex: 99,
+          background: "#7f1d1d", color: "#fca5a5", borderRadius: 6,
+          padding: "4px 10px", fontSize: 11, fontWeight: 700
+        }}>🔧 管理者モード</div>
+      )}
+
       {/* Header + Name */}
       <div style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
@@ -731,16 +784,19 @@ export default function VoiceRangeAnalyzer() {
               title="最低音 TOP 3" icon="🔽"
               entries={loRank} uid={uid}
               formatValue={(r) => `${r.lowestNote} (${r.lowestFreq.toFixed(1)}Hz)`}
+              isAdmin={isAdmin} onDelete={deleteRanking}
             />
             <RankingCard
               title="最高音 TOP 3" icon="🔼"
               entries={hiRank} uid={uid}
               formatValue={(r) => `${r.highestNote} (${r.highestFreq.toFixed(1)}Hz)`}
+              isAdmin={isAdmin} onDelete={deleteRanking}
             />
             <RankingCard
               title="音域幅 TOP 3" icon="📏"
               entries={rangeRank} uid={uid}
               formatValue={(r) => `${r.semitones}半音 (${r.octaves}oct)`}
+              isAdmin={isAdmin} onDelete={deleteRanking}
             />
           </div>
         </div>
