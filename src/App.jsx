@@ -4,6 +4,8 @@ import {
   doc, setDoc, deleteDoc, collection, query, orderBy, limit, getDocs,
   serverTimestamp,
 } from "firebase/firestore";
+import { analyzeFrames, compareVoices } from "./voiceSpectrum";
+import VoiceComparison from "./VoiceComparison";
 
 /* ════════════════════════════════════════════
    Pitch Detection — Autocorrelation (YIN-lite)
@@ -344,6 +346,7 @@ export default function VoiceRangeAnalyzer() {
   const [saved, setSaved] = useState(false);
   const [nameError, setNameError] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [voiceCmp, setVoiceCmp] = useState(null);
 
   const acRef = useRef(null);
   const anRef = useRef(null);
@@ -352,7 +355,10 @@ export default function VoiceRangeAnalyzer() {
   const pbRef = useRef([]);
   const loRef = useRef(null);
   const hiRef = useRef(null);
-  const susRef = useRef({ semi: null, count: 0 });
+  const susRef = useRef({ semi: null, count: 0, frames: [] });
+  // 最低音・最高音を記録した瞬間の波形（同じ音を保っていた直近数フレーム）。停止時に FFT で比べる
+  const loSnapRef = useRef(null);
+  const hiSnapRef = useRef(null);
 
   const uid = useRef(getOrCreateUserId()).current;
 
@@ -441,7 +447,8 @@ export default function VoiceRangeAnalyzer() {
       ac.createMediaStreamSource(stream).connect(an);
       acRef.current = ac; anRef.current = an; stRef.current = stream;
       pbRef.current = [];
-      susRef.current = { semi: null, count: 0 };
+      susRef.current = { semi: null, count: 0, frames: [] };
+      setVoiceCmp(null);
       setOn(true);
 
       const loop = () => {
@@ -460,26 +467,33 @@ export default function VoiceRangeAnalyzer() {
               setFreq(sf); setNote(sn);
 
               const currentSemi = Math.round(semiOf(sf));
-              if (susRef.current.semi === currentSemi) {
-                susRef.current.count++;
+              const sus = susRef.current;
+              if (sus.semi === currentSemi) {
+                sus.count++;
               } else {
-                susRef.current.semi = currentSemi;
-                susRef.current.count = 1;
+                sus.semi = currentSemi;
+                sus.count = 1;
+                sus.frames = [];
               }
+              sus.frames.push({ buf, f: sf });
+              if (sus.frames.length > 8) sus.frames.shift();
 
-              if (susRef.current.count >= 5) {
+              if (sus.count >= 5) {
+                const snap = { frames: sus.frames.slice(), sr: ac.sampleRate };
                 if (loRef.current === null || sf < loRef.current) {
                   loRef.current = sf; setLoF(sf); setLoN(sn);
+                  loSnapRef.current = snap;
                 }
                 if (hiRef.current === null || sf > hiRef.current) {
                   hiRef.current = sf; setHiF(sf); setHiN(sn);
+                  hiSnapRef.current = snap;
                 }
               }
             }
           }
         } else {
           setFreq(null); setNote(null);
-          susRef.current = { semi: null, count: 0 };
+          susRef.current = { semi: null, count: 0, frames: [] };
         }
         rafRef.current = requestAnimationFrame(loop);
       };
@@ -494,11 +508,23 @@ export default function VoiceRangeAnalyzer() {
     stRef.current?.getTracks().forEach(t => t.stop());
     acRef.current?.close();
     setOn(false); setFreq(null); setNote(null); setRms(0);
+
+    const lo = loSnapRef.current, hi = hiSnapRef.current;
+    if (lo && hi) {
+      try {
+        setVoiceCmp(compareVoices(
+          analyzeFrames(lo.frames, lo.sr, { withFormants: true }),
+          analyzeFrames(hi.frames, hi.sr),
+        ));
+      } catch (e) { console.error(e); setVoiceCmp(null); }
+    }
   }, []);
 
   const reset = useCallback(() => {
     loRef.current = null; hiRef.current = null;
-    susRef.current = { semi: null, count: 0 };
+    loSnapRef.current = null; hiSnapRef.current = null;
+    setVoiceCmp(null);
+    susRef.current = { semi: null, count: 0, frames: [] };
     setLoF(null); setHiF(null); setLoN(null); setHiN(null);
     setImg(null); setSaved(false);
     pbRef.current = [];
@@ -728,6 +754,18 @@ export default function VoiceRangeAnalyzer() {
         }}>{err}</div>
       )}
 
+      {/* Voice Comparison (FFT) */}
+      {hasRange && on && (
+        <div style={{ marginTop: 20, fontSize: 12, color: "#64748b", textAlign: "center", maxWidth: 400 }}>
+          測定を停止すると、最低音と最高音の倍音を比べて発声の変化を表示します
+        </div>
+      )}
+      {!on && voiceCmp && (
+        <div style={{ width: "100%", maxWidth: 440, marginTop: 28 }}>
+          <VoiceComparison cmp={voiceCmp} loN={loN} hiN={hiN} />
+        </div>
+      )}
+
       {/* Result Image */}
       {img && (
         <div style={{ marginTop: 28, textAlign: "center", maxWidth: 420, width: "100%" }}>
@@ -755,8 +793,8 @@ export default function VoiceRangeAnalyzer() {
           <div style={{ fontSize: 13, color: "#64748b", lineHeight: 1.7 }}>
             ① 右上に名前を入力<br/>
             ②「測定開始」を押してマイクを許可<br/>
-            ③ 出せる一番低い声から一番高い声まで出す<br/>
-            ④「測定停止」→ 𝕏 でシェア or ランキングに登録！
+            ③ 同じ母音（「あー」）で、一番低い声と一番高い声をそれぞれ少し伸ばして出す<br/>
+            ④「測定停止」→ 発声の変化（FFT解析）が出ます。𝕏 でシェア or ランキングに登録！
           </div>
         </div>
       )}
